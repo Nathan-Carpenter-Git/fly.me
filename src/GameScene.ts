@@ -8,9 +8,7 @@ import {
   Dest,
   FAST_MULT,
   TAXI_SPEED,
-  EXIT_SPEED,
   HEAVY_TURN_RADIUS,
-  ZONE_RADIUS,
   FONT,
   GREEN,
   GREEN_CSS,
@@ -19,8 +17,31 @@ import {
   STREAK_WINDOW,
   money,
 } from './config';
-import { Airport, Gate, LAYOUTS, Point, Runway, Stand, EXIT_FRAC } from './airport';
-import { Feature, LevelDef, getLevel, HAND_MADE_COUNT } from './levels';
+import { Airport, Gate, Point, Runway, Stand } from './airport';
+import {
+  ARRIVALS_END,
+  Career,
+  DAY_SECONDS,
+  DEPARTURES_END,
+  DayDef,
+  FEATURE_DAYS,
+  ItemId,
+  RUSH_END,
+  RUSH_START,
+  clearCareer,
+  clock,
+  dayDef,
+  demand,
+  effects,
+  homeLayout,
+  hourAt,
+  itemById,
+  layoutKey,
+  loadCareer,
+  newCareer,
+  saveCareer,
+} from './career';
+import { BuildMenu } from './buildMenu';
 import { createBackground, createTextures, TEX_SCALE } from './textures';
 import { Coach, CoachMsg } from './coach';
 import { sfx, unlockAudio, audioContext } from './audio';
@@ -80,6 +101,8 @@ interface Aircraft {
   hist: Point[];
   /** A helicopter hovering short of a busy helipad. */
   holding: boolean;
+  /** Seconds a departure has been parked, for the ground crew upgrade. */
+  wait: number;
 }
 
 interface Conflict {
@@ -89,7 +112,7 @@ interface Conflict {
   y: number;
 }
 
-type Mode = 'title' | 'intro' | 'play' | 'complete' | 'over';
+type Mode = 'title' | 'intro' | 'play' | 'summary' | 'build' | 'fired';
 
 interface Marker {
   icon: string;
@@ -114,7 +137,6 @@ const WARN_GAP = 36;
 const PICK_RADIUS = 40;
 const GROUND_PICK = 22;
 const PATH_STEP = 9;
-const APPROACH_TOL = Phaser.Math.DegToRad(60);
 const EDGE = 14;
 const BEST_KEY = 'flyme.best';
 const SEEN_KEY = 'flyme.tutorials';
@@ -130,7 +152,6 @@ const AIRLINES = ['FLY', 'SKY', 'NOVA', 'ORCA', 'JET', 'AERO', 'LARK', 'PIKE'];
 const HELI_CALLS = ['HELI', 'MEDIC', 'RANGER'];
 const AMBER = 0xffb020;
 /** How far ahead collision prediction looks, and its time step, in seconds. */
-const PREDICT_SECONDS = 6;
 const PREDICT_STEP = 0.25;
 /** Wingtip light positions in texture space (x along the fuselage, y along the wing). */
 const WINGTIPS: Partial<Record<Kind, [number, number]>> = {
@@ -173,8 +194,13 @@ function save(key: string, value: unknown) {
 export class GameScene extends Phaser.Scene {
   private planes: Aircraft[] = [];
   private airport!: Airport;
-  private level!: LevelDef;
-  private levelIndex = 0;
+  private day!: DayDef;
+  private career: Career = newCareer();
+  private built = new Set<ItemId>();
+  private fx2 = effects(new Set());
+  private buildMenu!: BuildMenu;
+  private rushAnnounced = false;
+  private dayStats = { earned: 0, landed: 0, departed: 0, greased: 0 };
   private mode: Mode = 'title';
   private paused = false;
   private coach!: Coach;
@@ -183,10 +209,7 @@ export class GameScene extends Phaser.Scene {
   private dragging: Aircraft | null = null;
   private hover: Aircraft | null = null;
   private score = 0;
-  private levelStartScore = 0;
   private best = 0;
-  private handled = 0;
-  private departed = 0;
   private departSpawned = 0;
   private elapsed = 0;
   private spawnIn = 0;
@@ -207,7 +230,7 @@ export class GameScene extends Phaser.Scene {
   private navLights!: Phaser.GameObjects.Graphics;
   private skipBtn!: Button;
   private musicBtn!: Button;
-  private levelPanel!: Phaser.GameObjects.Graphics;
+  private dayPanel!: Phaser.GameObjects.Graphics;
   private director = new Director();
   private speedBtn!: Button;
   private speedMul = 1;
@@ -224,7 +247,7 @@ export class GameScene extends Phaser.Scene {
   private clouds: Phaser.GameObjects.Image[] = [];
   private scoreText!: Phaser.GameObjects.Text;
   private bestText!: Phaser.GameObjects.Text;
-  private levelText!: Phaser.GameObjects.Text;
+  private dayText!: Phaser.GameObjects.Text;
   private progressText!: Phaser.GameObjects.Text;
   private progressBar!: Phaser.GameObjects.Graphics;
   private pauseText!: Phaser.GameObjects.Text;
@@ -257,12 +280,21 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.best = Number(load(BEST_KEY, 0)) || 0;
+    // Career bests replaced per-run scores; keep the key but read it as dollars.
     this.seen = new Set(load<string[]>(SEEN_KEY, []));
     this.coach = new Coach(this);
     this.music = new Music(audioContext, load(MUSIC_KEY, true), (name) => this.showTrack(name));
     this.buildHud();
     this.bindInput();
-    this.loadLevel(0);
+    this.buildMenu = new BuildMenu(
+      this,
+      (x, y, str, size, color, weight) => this.text(x, y, str, size, color, weight),
+      (id) => this.buy(id),
+      () => this.finishBuilding(),
+    );
+    this.career = loadCareer() ?? newCareer();
+    this.setScore(this.career.cash);
+    this.loadDay();
     this.showTitle();
 
     if (import.meta.env.DEV) (window as unknown as { __scene: GameScene }).__scene = this;
@@ -285,20 +317,20 @@ export class GameScene extends Phaser.Scene {
   private buildHud() {
     this.statPanel = this.add.graphics().setDepth(99);
 
-    this.scoreLabel = this.text(30, 22, 'EARNED', 12, '#a9c4b4').setLetterSpacing(2);
+    this.scoreLabel = this.text(30, 22, 'CASH', 12, '#a9c4b4').setLetterSpacing(2);
     this.scoreText = this.text(30, 36, money(0), 28, '#ffffff', 800);
-    this.bestLabel = this.text(0, 22, 'BEST', 12, '#a9c4b4').setLetterSpacing(2);
+    this.bestLabel = this.text(0, 22, 'BEST CAREER', 12, '#a9c4b4').setLetterSpacing(2);
     this.bestText = this.text(0, 36, money(this.best), 28, '#ffffff', 800);
     this.layoutStatPanels();
     this.streakG = this.add.graphics().setDepth(99);
     this.streakText = this.text(30, 93, '', 13, '#ffc93c', 800).setOrigin(0, 0.5).setLetterSpacing(1);
 
-    this.levelPanel = this.add.graphics().setDepth(99);
-    this.levelText = this.text(W / 2, 22, '', 12, '#a9c4b4').setOrigin(0.5, 0).setLetterSpacing(2);
+    this.dayPanel = this.add.graphics().setDepth(99);
+    this.dayText = this.text(W / 2, 22, '', 12, '#a9c4b4').setOrigin(0.5, 0).setLetterSpacing(2);
     this.progressText = this.text(W / 2, 38, '', 15, '#ffffff', 700).setOrigin(0.5, 0);
     this.progressBar = this.add.graphics().setDepth(100);
 
-    this.skipBtn = this.makeButton(80, 'Skip level  ·  N');
+    this.skipBtn = this.makeButton(80, 'End day  ·  N');
     this.musicBtn = this.makeButton(112, '');
     this.updateMusicLabel();
     this.speedBtn = this.makeButton(144, '');
@@ -349,9 +381,9 @@ export class GameScene extends Phaser.Scene {
   private buildLegend() {
     for (const o of this.legend) o.destroy();
     this.legend = [];
-    const mix = this.level.mix;
+    const mix = this.day.mix;
     const kinds: Kind[] = (['jet', 'heavy', 'prop', 'heli', 'transit'] as Kind[]).filter((k) => mix[k]);
-    if (this.level.features.has('depart') && !kinds.includes('transit')) kinds.push('depart');
+    if (this.day.features.has('depart') && !kinds.includes('transit')) kinds.push('depart');
     const items: [Kind, string][] = kinds.map((k) => [k, KINDS[k].legend]);
 
     const bg = this.add.graphics().setDepth(99);
@@ -477,25 +509,27 @@ export class GameScene extends Phaser.Scene {
     this.tweens.add({ targets: this.trackText, alpha: 0, duration: 1200, delay: 6500 });
   }
 
+  /** Day panel: day number, clock, and a timeline with the rush hour band. */
   private updateProgress() {
-    const lv = this.level;
-    this.levelText.setText(`LEVEL ${lv.number}  ·  ${this.airport.def.name.toUpperCase()}`);
-    const parts = [`Planes ${Math.min(this.handled, lv.goal)}/${lv.goal}`];
-    if (lv.departGoal) parts.push(`Departures ${Math.min(this.departed, lv.departGoal)}/${lv.departGoal}`);
-    this.progressText.setText(parts.join('     '));
-    const panelW = Math.max(380, Math.ceil(Math.max(this.levelText.width, this.progressText.width)) + 48);
-    this.levelPanel.clear();
-    this.levelPanel.fillStyle(0x0b1410, 0.6);
-    this.levelPanel.fillRoundedRect(W / 2 - panelW / 2, 14, panelW, 58, 12);
+    this.dayText.setText(`DAY ${this.career.day}  ·  ${this.airport.def.name.toUpperCase()}`);
+    const hour = hourAt(this.elapsed);
+    const rush = hour >= RUSH_START && hour < RUSH_END;
+    this.progressText.setText(rush ? `${clock(hour)}   RUSH HOUR` : clock(hour)).setColor(rush ? '#ffc93c' : '#ffffff');
+    const panelW = Math.max(380, Math.ceil(Math.max(this.dayText.width, this.progressText.width)) + 48);
+    this.dayPanel.clear();
+    this.dayPanel.fillStyle(0x0b1410, 0.6);
+    this.dayPanel.fillRoundedRect(W / 2 - panelW / 2, 14, panelW, 58, 12);
     const barW = panelW - 40;
-    const total = lv.goal + lv.departGoal;
-    const done = Math.min(this.handled, lv.goal) + Math.min(this.departed, lv.departGoal);
+    const x0 = W / 2 - barW / 2;
+    const at = (h: number) => x0 + (barW * (h - 6)) / 16;
     const g = this.progressBar;
     g.clear();
     g.fillStyle(0xffffff, 0.12);
-    g.fillRoundedRect(W / 2 - barW / 2, 62, barW, 4, 2);
+    g.fillRoundedRect(x0, 62, barW, 4, 2);
+    g.fillStyle(0xffc93c, 0.35);
+    g.fillRect(at(RUSH_START), 62, at(RUSH_END) - at(RUSH_START), 4);
     g.fillStyle(GREEN, 0.9);
-    if (done > 0) g.fillRoundedRect(W / 2 - barW / 2, 62, (barW * done) / total, 4, 2);
+    if (hour > 6) g.fillRoundedRect(x0, 62, at(hour) - x0, 4, 2);
   }
 
   private setScore(v: number) {
@@ -671,28 +705,38 @@ export class GameScene extends Phaser.Scene {
     return { minW, place };
   }
 
-  private levelMarkers(lv: LevelDef): Marker[] {
-    const mix = lv.mix;
-    const isNew = (f: Feature) => lv.introduces === f;
-    const plane = (kind: Kind, label: string, isNewItem = false): Marker => ({
+  /** What today brings: traffic types, conditions, and anything new since yesterday. */
+  private dayMarkers(): Marker[] {
+    const d = this.day;
+    const fresh = new Set(this.career.fresh);
+    const unlocks: Partial<Record<Kind, ItemId>> = { jet: 'long', heli: 'pad1', heavy: 'extend', transit: 'contract' };
+    const plane = (kind: Kind, label: string): Marker => ({
       icon: `ac-${kind}`,
       rotate: true,
       rotor: kind === 'heli',
       label,
-      tag: KINDS[kind].dest === 'long' ? 'Long runway' : KINDS[kind].dest === 'short' ? 'Short runway' : KINDS[kind].dest === 'pad' ? 'Helipad' : 'Exit gate',
+      tag: { long: 'Long runway', short: 'Short runway', pad: 'Helipad', gate: 'Exit gate' }[KINDS[kind].dest],
       tagColor: KINDS[kind].css,
-      isNew: isNewItem,
+      isNew: unlocks[kind] ? fresh.has(unlocks[kind]!) : false,
     });
     const list: Marker[] = [];
-    if (mix.jet) list.push(plane('jet', 'Jets'));
-    if (mix.heavy) list.push(plane('heavy', 'Heavy jets', isNew('heavy')));
-    if (mix.prop) list.push(plane('prop', 'Props'));
-    if (mix.heli) list.push(plane('heli', 'Helicopters'));
-    if (lv.features.has('depart')) list.push(plane('depart', 'Departures', isNew('depart')));
-    if (mix.transit) list.push(plane('transit', 'Overflights', isNew('transit')));
-    if (lv.features.has('fast')) list.push({ icon: 'icon-fast', rotate: true, label: 'Fast planes', isNew: isNew('fast') });
-    if (lv.features.has('wind')) list.push({ icon: 'icon-wind', label: 'Wind shifts', isNew: isNew('wind') });
-    if (lv.features.has('fuel')) list.push({ icon: 'icon-fuel', label: 'Fuel emergencies', isNew: isNew('fuel') });
+    if (d.mix.jet) list.push(plane('jet', 'Jets'));
+    if (d.mix.heavy) list.push(plane('heavy', 'Heavy jets'));
+    if (d.mix.prop) list.push(plane('prop', 'Props'));
+    if (d.mix.heli) list.push(plane('heli', 'Helicopters'));
+    list.push(plane('depart', 'Departures'));
+    if (d.mix.transit) list.push(plane('transit', 'Overflights'));
+    const isNew = (f: 'fast' | 'wind' | 'fuel') => FEATURE_DAYS[f] === d.day;
+    if (d.features.has('fast')) list.push({ icon: 'icon-fast', rotate: true, label: 'Fast planes', isNew: isNew('fast') });
+    if (d.features.has('wind')) list.push({ icon: 'icon-wind', label: 'Wind shifts', isNew: isNew('wind') });
+    if (d.features.has('fuel')) list.push({ icon: 'icon-fuel', label: 'Fuel emergencies', isNew: isNew('fuel') });
+    // Purchases that do not unlock a traffic type still get a NEW chip so the player sees them land.
+    const traffic = new Set(Object.values(unlocks));
+    for (const id of this.career.fresh) {
+      if (traffic.has(id)) continue;
+      const item = itemById(id);
+      list.push({ icon: item.icon, rotate: item.rotate, label: item.name, tag: item.effect, isNew: true });
+    }
     return list.sort((a, b) => Number(!!b.isNew) - Number(!!a.isNew));
   }
 
@@ -705,80 +749,59 @@ export class GameScene extends Phaser.Scene {
 
   private showTitle() {
     this.mode = 'title';
+    const saved = loadCareer();
     this.showCard({
-      kicker: '',
+      kicker: saved ? `DAY ${saved.day}  ·  ${money(saved.cash)}` : '',
       title: 'fly.me',
       keys: [
-        [`1-${HAND_MADE_COUNT}`, 'Level'],
         ['P', 'Pause'],
+        ['F', 'Speed'],
         ['M', 'Music'],
         ['R', 'Reset tips'],
       ],
-      prompt: 'Click to play',
+      prompt: saved ? 'Click to continue' : 'Click to play',
     });
   }
 
-  private showIntro(index: number) {
-    this.loadLevel(index);
+  private showDayIntro() {
+    this.loadDay();
     this.mode = 'intro';
-    const lv = this.level;
-    const stats: [string, string][] = [['PLANES', String(lv.goal)]];
-    if (lv.departGoal) stats.push(['DEPARTURES', String(lv.departGoal)]);
     this.showCard({
-      kicker: `LEVEL ${lv.number}`,
+      kicker: `DAY ${this.career.day}`,
       title: this.airport.def.name,
-      markers: this.levelMarkers(lv),
-      stats,
-      prompt: 'Click to start',
+      markers: this.dayMarkers(),
+      stats: [
+        ['CASH', money(this.career.cash)],
+        ['RUSH HOUR', `${clock(RUSH_START)} to ${clock(RUSH_END)}`],
+      ],
+      prompt: 'Click to start the day',
     });
   }
 
-  // ---------------------------------------------------------------- level flow
+  // ---------------------------------------------------------------- day flow
 
-  private loadLevel(index: number) {
+  /** Builds the airport for the current career and resets everything for a fresh day. */
+  private loadDay() {
     for (const a of this.planes) this.destroyPlane(a);
     this.planes = [];
     this.coach.clear();
-    this.levelIndex = index;
-    this.level = getLevel(index);
-    this.airport = new Airport(LAYOUTS[this.level.layout]);
+    this.built = new Set(this.career.built);
+    this.day = dayDef(this.career.day, this.built);
+    this.fx2 = effects(this.built);
+    this.applyLayout();
 
-    const key = `bg-${this.level.layout}`;
-    if (key !== this.bgKey) {
-      createBackground(this, key, this.airport);
-      this.bg.setTexture(key).setScale(1 / TEX_SCALE);
-      if (this.bgKey && this.textures.exists(this.bgKey)) this.textures.remove(this.bgKey);
-      this.bgKey = key;
-    }
-
-    for (const t of this.gateLabels) t.destroy();
-    this.gateLabels = [];
-    if (this.hasOutbound()) {
-      for (const g of this.airport.gates) {
-        const c = g.center(30);
-        this.gateLabels.push(
-          this.text(c.x, c.y, `EXIT ${g.id}`, 12, '#0b1410', 800)
-            .setOrigin(0.5)
-            .setBackgroundColor(GREEN_CSS)
-            .setPadding(6, 3, 6, 3)
-            .setDepth(13),
-        );
-      }
-    }
-
-    this.handled = 0;
-    this.departed = 0;
+    this.dayStats = { earned: 0, landed: 0, departed: 0, greased: 0 };
     this.departSpawned = 0;
     this.elapsed = 0;
-    this.spawnIn = 0.8;
-    this.departIn = this.level.number === 1 ? 14 : 6;
-    this.windIn = rand(this.level.windEvery);
+    this.spawnIn = 1.5;
+    this.departIn = this.career.day === 1 ? 14 : 6;
+    this.windIn = rand(this.day.windEvery);
     this.windWarned = false;
+    this.rushAnnounced = false;
     this.paused = false;
     this.dragging = null;
     this.hover = null;
     this.pauseText.setVisible(false);
-    this.levelStartScore = this.score;
     this.director.reset();
     this.streak = 0;
     this.streakLeft = 0;
@@ -788,8 +811,32 @@ export class GameScene extends Phaser.Scene {
     this.updateProgress();
   }
 
+  /** Rebuilds the airport geometry and map art from the current set of facilities. */
+  private applyLayout() {
+    this.airport = new Airport(homeLayout(this.built));
+    const key = layoutKey(this.built);
+    if (key !== this.bgKey) {
+      createBackground(this, key, this.airport);
+      this.bg.setTexture(key).setScale(1 / TEX_SCALE);
+      if (this.bgKey && this.textures.exists(this.bgKey)) this.textures.remove(this.bgKey);
+      this.bgKey = key;
+    }
+    for (const t of this.gateLabels) t.destroy();
+    this.gateLabels = [];
+    for (const g of this.airport.gates) {
+      const c = g.center(30);
+      this.gateLabels.push(
+        this.text(c.x, c.y, `EXIT ${g.id}`, 12, '#0b1410', 800)
+          .setOrigin(0.5)
+          .setBackgroundColor(GREEN_CSS)
+          .setPadding(6, 3, 6, 3)
+          .setDepth(13),
+      );
+    }
+  }
+
   private hasOutbound() {
-    return !!this.level.mix.transit || this.level.features.has('depart');
+    return !!this.day.mix.transit || this.day.features.has('depart');
   }
 
   private startPlay() {
@@ -797,51 +844,99 @@ export class GameScene extends Phaser.Scene {
     this.hideCard();
   }
 
-  private retryLevel() {
-    this.setScore(this.levelStartScore);
-    this.loadLevel(this.levelIndex);
-    this.startPlay();
+  /** Starts from the saved career, or a brand new one after being fired. */
+  private startCareer(fresh: boolean) {
+    if (fresh) clearCareer();
+    this.career = (fresh ? null : loadCareer()) ?? newCareer();
+    this.setScore(this.career.cash);
+    saveCareer(this.career);
+    this.showDayIntro();
   }
 
-  private skipLevel() {
-    this.showIntro(this.levelIndex + 1);
-  }
-
-  private completeLevel() {
+  private endDay() {
     if (this.mode !== 'play') return;
-    this.mode = 'complete';
+    this.mode = 'summary';
     this.dragging = null;
     this.setSpeed(1);
+    this.coach.clear();
     this.time0 = this.time.now;
     sfx.levelUp();
-    this.saveBest();
-    this.time.delayedCall(500, () =>
+    const stats = this.dayStats;
+    const finished = this.career.day;
+    this.career = {
+      ...this.career,
+      day: finished + 1,
+      cash: this.score,
+      earned: this.career.earned + stats.earned,
+      fresh: [],
+    };
+    saveCareer(this.career);
+    this.saveBest(this.career.earned);
+    this.time.delayedCall(500, () => {
+      if (this.mode !== 'summary') return;
       this.showCard({
-        kicker: `LEVEL ${this.level.number}`,
-        title: 'Cleared',
+        kicker: `DAY ${finished}`,
+        title: 'Shift over',
         stats: [
-          ['EARNED', money(this.score)],
-          ['BEST', money(this.best)],
+          ['EARNED', money(stats.earned)],
+          ['LANDINGS', String(stats.landed)],
+          ['DEPARTURES', String(stats.departed)],
+          ['GREASED', String(stats.greased)],
         ],
-        prompt: 'Click for the next level',
-      }),
-    );
+        prompt: 'Click to open the build menu',
+      });
+    });
   }
 
-  private saveBest() {
-    if (this.score <= this.best) return false;
-    this.best = this.score;
+  private openBuild() {
+    this.mode = 'build';
+    this.hideCard();
+    for (const a of this.planes) this.destroyPlane(a);
+    this.planes = [];
+    this.clearRadio();
+    this.built = new Set(this.career.built);
+    this.applyLayout();
+    this.buildMenu.show(this.career);
+  }
+
+  private buy(id: ItemId) {
+    const item = itemById(id);
+    if (this.career.cash < item.price || this.career.built.includes(id)) return;
+    this.career = {
+      ...this.career,
+      cash: this.career.cash - item.price,
+      built: [...this.career.built, id],
+      fresh: [...this.career.fresh, id],
+    };
+    saveCareer(this.career);
+    this.setScore(this.career.cash);
+    this.built = new Set(this.career.built);
+    this.applyLayout();
+    this.buildMenu.refresh(this.career);
+    sfx.buy();
+  }
+
+  private finishBuilding() {
+    this.buildMenu.hide();
+    this.showDayIntro();
+  }
+
+  private saveBest(total: number) {
+    if (total <= this.best) return false;
+    this.best = total;
     this.bestText.setText(money(this.best));
     this.layoutStatPanels();
     save(BEST_KEY, this.best);
     return true;
   }
 
-  private gameOver(a: Aircraft, b: Aircraft | null, title = 'Crash') {
+  /** A crash or a plane running dry gets you fired: the whole career starts over. */
+  private gameOver(a: Aircraft, b: Aircraft | null, title = 'Mid-air collision') {
     if (this.mode !== 'play') return;
-    this.mode = 'over';
+    this.mode = 'fired';
     this.dragging = null;
     this.setSpeed(1);
+    this.coach.clear();
     this.time0 = this.time.now;
     sfx.crash();
     this.explode(b ? (a.x + b.x) / 2 : a.x, b ? (a.y + b.y) / 2 : a.y);
@@ -849,18 +944,22 @@ export class GameScene extends Phaser.Scene {
       const parts = [p.sprite, p.shadow, p.rotor, p.rotorShadow, p.tag, p.label].filter(Boolean);
       this.tweens.add({ targets: parts, alpha: 0, duration: 400 });
     }
-    const newBest = this.saveBest();
-    this.time.delayedCall(1100, () =>
+    const days = this.career.day - 1;
+    const total = this.career.earned + this.dayStats.earned;
+    const newBest = this.saveBest(total);
+    clearCareer();
+    this.time.delayedCall(1100, () => {
+      if (this.mode !== 'fired') return;
       this.showCard({
-        kicker: `LEVEL ${this.level.number}  ·  ${this.airport.def.name.toUpperCase()}`,
-        title,
+        kicker: `DAY ${this.career.day}  ·  ${title.toUpperCase()}`,
+        title: "You're fired",
         stats: [
-          ['EARNED', money(this.score)],
-          [newBest ? 'NEW BEST' : 'BEST', money(this.best)],
+          ['DAYS SURVIVED', String(days)],
+          [newBest ? 'NEW BEST' : 'CAREER EARNINGS', money(total)],
         ],
-        prompt: 'Click to retry',
-      }),
-    );
+        prompt: 'Click to start over',
+      });
+    });
   }
 
   private explode(x: number, y: number) {
@@ -997,6 +1096,11 @@ export class GameScene extends Phaser.Scene {
       this.music.start();
       const x = p.worldX;
       const y = p.worldY;
+      // The build panel covers the HUD buttons, so it gets first pick of clicks.
+      if (this.mode === 'build') {
+        this.buildMenu.pointerDown(x, y);
+        return;
+      }
       if (this.mode === 'play' && this.hit(this.speedBtn, x, y)) {
         this.setSpeed(this.speedMul > 1 ? 1 : FAST_FORWARD);
         return;
@@ -1008,20 +1112,20 @@ export class GameScene extends Phaser.Scene {
       if (this.coach.dismiss()) return;
       switch (this.mode) {
         case 'title':
-          this.showIntro(0);
+          this.startCareer(false);
           return;
         case 'intro':
           this.startPlay();
           return;
-        case 'complete':
-          if (this.time.now - this.time0 > 900) this.showIntro(this.levelIndex + 1);
+        case 'summary':
+          if (this.time.now - this.time0 > 900) this.openBuild();
           return;
-        case 'over':
-          if (this.time.now - this.time0 > 1200) this.retryLevel();
+        case 'fired':
+          if (this.time.now - this.time0 > 1200) this.startCareer(true);
           return;
       }
       if (this.hit(this.skipBtn, x, y)) {
-        this.skipLevel();
+        this.endDay();
         return;
       }
       if (this.paused) return;
@@ -1039,6 +1143,10 @@ export class GameScene extends Phaser.Scene {
     });
 
     this.input.on('pointermove', (p: Phaser.Input.Pointer) => {
+      if (this.mode === 'build') {
+        this.buildMenu.pointerMove(p.worldX, p.worldY);
+        return;
+      }
       const plane = this.dragging;
       if (!plane) {
         this.hover = this.mode === 'play' ? this.pick(p.worldX, p.worldY) ?? this.pickGround(p.worldX, p.worldY) : null;
@@ -1063,18 +1171,24 @@ export class GameScene extends Phaser.Scene {
     });
     kb?.on('keydown-SPACE', () => this.togglePause());
     kb?.on('keydown-N', () => {
-      if (this.mode === 'play' || this.mode === 'intro' || this.mode === 'complete') {
+      if (this.mode === 'play') {
         this.coach.clear();
-        this.skipLevel();
+        this.endDay();
       }
     });
+    if (import.meta.env.DEV) {
+      // Development shortcut for trying out the build menu.
+      kb?.on('keydown-C', () => {
+        if (this.mode !== 'build') return;
+        this.career = { ...this.career, cash: this.career.cash + 10000 };
+        saveCareer(this.career);
+        this.setScore(this.career.cash);
+        this.buildMenu.refresh(this.career);
+      });
+    }
     kb?.on('keydown', (e: KeyboardEvent) => {
       if (this.mode !== 'title') return;
-      const n = Number(e.key);
-      if (n >= 1 && n <= HAND_MADE_COUNT) {
-        unlockAudio();
-        this.showIntro(n - 1);
-      } else if (e.key === 'r' || e.key === 'R') {
+      if (e.key === 'r' || e.key === 'R') {
         this.seen.clear();
         save(SEEN_KEY, []);
         this.showBanner('Tips reset', GREEN_CSS);
@@ -1188,14 +1302,14 @@ export class GameScene extends Phaser.Scene {
       return g && g.depth(pt) < 36 && g.inSpan(pt) ? { type: 'gate', gate: g } : null;
     }
     if (dest === 'pad') {
-      const pad = this.airport.pads.find((p) => dist(p, pt) < ZONE_RADIUS);
+      const pad = this.airport.pads.find((p) => dist(p, pt) < this.fx2.landingZone);
       return pad ? { type: 'pad', pad } : null;
     }
     for (const rw of this.airport.runways) {
-      if (rw.size !== dest || dist(pt, rw.threshold()) > ZONE_RADIUS) continue;
+      if (rw.size !== dest || dist(pt, rw.threshold()) > this.fx2.landingZone) continue;
       const from = a.path[a.path.length - 4] ?? a;
       const dir = Math.atan2(pt.y - from.y, pt.x - from.x);
-      if (Math.abs(Angle.Wrap(dir - rw.angle())) < APPROACH_TOL) return { type: 'runway', rw };
+      if (Math.abs(Angle.Wrap(dir - rw.angle())) < Phaser.Math.DegToRad(this.fx2.approachTolDeg)) return { type: 'runway', rw };
     }
     return null;
   }
@@ -1249,6 +1363,7 @@ export class GameScene extends Phaser.Scene {
       grade: null,
       hist: [],
       holding: false,
+      wait: 0,
     };
     a.callsign = this.makeCallsign(kind);
     a.label = this.text(x, y, a.callsign, 10, '#e8f0ea', 700).setOrigin(0.5, 0).setStroke('#0b1410', 3).setAlpha(0.85).setDepth(22);
@@ -1279,9 +1394,9 @@ export class GameScene extends Phaser.Scene {
     return load;
   }
 
+  /** Director capacity follows the day's demand curve, peaking at rush hour. */
   private capacity() {
-    const lv = this.level;
-    return Phaser.Math.Linear(lv.maxAir[0], lv.maxAir[1], this.progress());
+    return this.day.capacity * (0.75 + 0.25 * demand(hourAt(this.elapsed)));
   }
 
   /** How crowded each kind of destination is right now. */
@@ -1307,7 +1422,7 @@ export class GameScene extends Phaser.Scene {
   /** Returns false when the director decided the sky is too busy for a new arrival. */
   private spawnArrival() {
     if (!this.director.allowSpawn(this.trafficLoad(), this.capacity())) return false;
-    const kind = this.director.pickKind(this.level.mix, this.destLoad());
+    const kind = this.director.pickKind(this.day.mix, this.destLoad());
     let gate: Gate | undefined;
     let aim: Point;
     if (kind === 'transit') {
@@ -1317,7 +1432,7 @@ export class GameScene extends Phaser.Scene {
     } else {
       aim = this.aimPoint(kind);
     }
-    const fast = kind !== 'heavy' && Math.random() < this.level.fastChance;
+    const fast = kind !== 'heavy' && Math.random() < this.day.fastChance;
     const speed = KINDS[kind].speed * (fast ? FAST_MULT : 1);
     const others = this.planes
       .filter((a) => this.inAir(a))
@@ -1329,11 +1444,11 @@ export class GameScene extends Phaser.Scene {
     sfx.incoming();
     const emergencyActive = this.planes.some((p) => p.fuelMax > 0 && p.state === 'flying');
     if (
-      this.level.features.has('fuel') &&
+      this.day.features.has('fuel') &&
       KINDS[kind].dest !== 'gate' &&
       !emergencyActive &&
       this.trafficLoad() < this.capacity() - 1 &&
-      Math.random() < this.level.fuelChance
+      Math.random() < this.day.fuelChance
     ) {
       // Enough fuel for a direct approach with room to spare, but not for wandering.
       const reach = Math.hypot(aim.x - e.x, aim.y - e.y) / a.speed;
@@ -1346,9 +1461,8 @@ export class GameScene extends Phaser.Scene {
   }
 
   private spawnDeparture() {
-    const lv = this.level;
     const waiting = this.planes.filter((a) => a.kind === 'depart' && a.state !== 'flying').length;
-    if (this.departSpawned >= lv.departGoal + 3 || waiting >= 2) return;
+    if (waiting >= Math.min(3, Math.ceil(this.airport.stands.length / 2))) return;
     if (!this.director.allowSpawn(this.trafficLoad(), this.capacity() + 0.5)) return;
     const free = this.airport.stands.filter((s) => !s.occupant);
     if (!free.length) return;
@@ -1388,11 +1502,6 @@ export class GameScene extends Phaser.Scene {
     if (a.stand?.occupant === a) a.stand.occupant = null;
   }
 
-  private progress() {
-    const lv = this.level;
-    return Phaser.Math.Clamp((this.handled + this.departed) / (lv.goal + lv.departGoal), 0, 1);
-  }
-
   // ---------------------------------------------------------------- simulation
 
   update(_time: number, deltaMs: number) {
@@ -1416,27 +1525,38 @@ export class GameScene extends Phaser.Scene {
 
   private simulate(dt: number) {
     this.elapsed += dt;
-    const lv = this.level;
+    const d = this.day;
+    const hour = hourAt(this.elapsed);
+    const busy = demand(hour);
     this.director.update(dt);
     if (this.streakLeft > 0) {
       this.streakLeft = Math.max(0, this.streakLeft - dt);
       if (this.streakLeft === 0) this.streak = 0;
     }
-    this.spawnIn -= dt;
-    if (this.spawnIn <= 0) {
-      // When the director holds an arrival back, check again shortly.
-      this.spawnIn = this.spawnArrival()
-        ? Phaser.Math.Linear(lv.spawn[0], lv.spawn[1], this.progress()) * (0.8 + Math.random() * 0.4)
-        : 1;
+    if (!this.rushAnnounced && hour >= RUSH_START) {
+      this.rushAnnounced = true;
+      this.slowDown();
+      sfx.wind();
+      this.showBanner('Rush hour', '#ffc93c', 2500);
     }
-    if (lv.features.has('depart')) {
-      this.departIn -= dt;
-      if (this.departIn <= 0) {
-        this.spawnDeparture();
-        this.departIn = rand(lv.departEvery);
+    this.spawnIn -= dt;
+    if (this.spawnIn <= 0 && hour < ARRIVALS_END) {
+      // When the director holds an arrival back, check again shortly.
+      this.spawnIn = this.spawnArrival() ? (d.interval / busy) * (0.8 + Math.random() * 0.4) : 1;
+    }
+    this.departIn -= dt;
+    if (this.departIn <= 0 && hour < DEPARTURES_END) {
+      this.spawnDeparture();
+      this.departIn = rand(d.departEvery) / Math.max(0.7, busy);
+    }
+    if (this.fx2.autoTaxi) {
+      for (const a of this.planes) {
+        if (a.state !== 'parked') continue;
+        a.wait += dt;
+        if (a.wait > 1.5) this.clearGround(a);
       }
     }
-    if (lv.features.has('wind')) this.updateWind(dt);
+    if (d.features.has('wind')) this.updateWind(dt);
     for (const a of this.planes) {
       if (this.mode !== 'play') break;
       this.step(a, dt);
@@ -1446,27 +1566,30 @@ export class GameScene extends Phaser.Scene {
     if (this.mode === 'play') this.checkConflicts();
     if (this.mode === 'play') this.predictConflicts();
     if (this.mode === 'play') this.checkTutorials();
+    if (this.mode === 'play') this.updateProgress();
+    if (this.mode === 'play' && this.elapsed >= DAY_SECONDS) this.endDay();
   }
 
   private updateWind(dt: number) {
     this.windIn -= dt;
-    if (!this.windWarned && this.windIn <= 5) {
+    const warning = this.fx2.windWarning;
+    if (!this.windWarned && this.windIn <= warning) {
       this.windWarned = true;
       this.slowDown();
       sfx.wind();
-      this.showBanner('Wind shift in 5', '#ffc93c', 3000);
+      this.showBanner(`Wind shift in ${warning}`, '#ffc93c', 3000);
       const rw = this.airport.runways[0];
       const c = rw.center(rw.length / 2);
       this.tutorial('wind', {
         kicker: 'NEW',
         title: 'Wind shift',
-        text: 'In 5 seconds the runways flip. The blinking arrows show the new approach. Routes to the old end get cancelled.',
+        text: `In ${warning} seconds the runways flip. The blinking arrows show the new approach. Routes to the old end get cancelled.`,
         color: '#ffc93c',
         focus: { x: c.x, y: c.y, r: rw.length / 2 + 30 },
       });
     }
     if (this.windIn > 0) return;
-    this.windIn = rand(this.level.windEvery);
+    this.windIn = rand(this.day.windEvery);
     this.windWarned = false;
     for (const rw of this.airport.runways) rw.active = rw.active === 0 ? 1 : 0;
     for (const a of this.planes) {
@@ -1522,7 +1645,7 @@ export class GameScene extends Phaser.Scene {
         return a.target?.type === 'pad' ? this.stepHeliLanding(a, dt) : this.stepFinal(a, dt);
       case 'vacate': {
         const rw = a.rw!;
-        this.followRoute(a, a.onRunway ? EXIT_SPEED : TAXI_SPEED, dt);
+        this.followRoute(a, a.onRunway ? this.fx2.exitSpeed : TAXI_SPEED, dt);
         if (a.onRunway) {
           const c = rw.center(rw.length / 2);
           const off = Math.abs((a.x - c.x) * rw.nx + (a.y - c.y) * rw.ny);
@@ -1676,13 +1799,10 @@ export class GameScene extends Phaser.Scene {
 
   private exitGate(a: Aircraft) {
     a.state = 'gone';
-    if (a.kind === 'depart') this.departed++;
-    else this.handled++;
+    if (a.kind === 'depart') this.dayStats.departed++;
     const c = a.gate!.center(46);
     this.earn(a, c);
     sfx.exit();
-    this.updateProgress();
-    this.checkComplete();
   }
 
   /** Pays out for a handled aircraft: fare, streak multiplier, approach bonus and emergency bonus. */
@@ -1691,7 +1811,10 @@ export class GameScene extends Phaser.Scene {
     this.streakLeft = STREAK_WINDOW;
     const gradeMult = a.grade === 'greased' ? 1.5 : a.grade === 'smooth' ? 1.2 : 1;
     const emergency = a.fuelMax > 0 ? EMERGENCY_BONUS : 0;
-    const amount = Math.round((FARES[a.kind] * this.multiplier() * gradeMult + emergency) / 10) * 10;
+    const amount =
+      Math.round((FARES[a.kind] * this.fx2.fareMult * this.multiplier() * gradeMult + emergency) / 10) * 10;
+    this.dayStats.earned += amount;
+    if (a.grade === 'greased') this.dayStats.greased++;
     this.setScore(this.score + amount);
     this.bumpScore();
     this.popText(at.x, at.y, `+${money(amount)}`, emergency ? '#ffb020' : KINDS[a.kind].css);
@@ -1703,10 +1826,6 @@ export class GameScene extends Phaser.Scene {
 
   private bumpScore() {
     this.tweens.add({ targets: this.scoreText, scale: { from: 1.35, to: 1 }, duration: 260, ease: 'Back.Out' });
-  }
-
-  private checkComplete() {
-    if (this.handled >= this.level.goal && this.departed >= this.level.departGoal) this.completeLevel();
   }
 
   private beginFinal(a: Aircraft) {
@@ -1739,11 +1858,11 @@ export class GameScene extends Phaser.Scene {
   private stepFinal(a: Aircraft, dt: number) {
     const rw = a.rw!;
     const touch = rw.length * 0.14;
-    const exit = rw.length * EXIT_FRAC;
+    const exit = rw.length * rw.exitFrac;
     if (a.along < touch) a.v = a.speed * 0.9;
     else {
       const k = Phaser.Math.Clamp((a.along - touch) / (exit - touch), 0, 1);
-      a.v = Phaser.Math.Linear(a.speed * 0.85, EXIT_SPEED, k);
+      a.v = Phaser.Math.Linear(a.speed * 0.85, this.fx2.exitSpeed, k);
     }
     a.along += a.v * dt;
     a.lateral *= Math.max(0, 1 - dt * 4);
@@ -1803,12 +1922,10 @@ export class GameScene extends Phaser.Scene {
   }
 
   private scoreLanding(a: Aircraft) {
-    this.handled++;
+    this.dayStats.landed++;
     this.earn(a, a);
     sfx.land(this.streak);
     if (a.fuelMax > 0) this.radio(`${a.callsign}, on the ground, thank you`);
-    this.updateProgress();
-    this.checkComplete();
   }
 
   private stepHeliLanding(a: Aircraft, dt: number) {
@@ -1892,7 +2009,7 @@ export class GameScene extends Phaser.Scene {
     let idx = 0;
     const path = a.state === 'flying' ? a.path : [];
     const landing = a.target !== null && a.target.type !== 'gate';
-    const steps = PREDICT_SECONDS / PREDICT_STEP;
+    const steps = this.fx2.predictSeconds / PREDICT_STEP;
     if (a.holding) return Array.from({ length: steps }, () => ({ x, y }));
     for (let i = 0; i < steps; i++) {
       let d = a.speed * PREDICT_STEP;
@@ -1994,7 +2111,7 @@ export class GameScene extends Phaser.Scene {
         if (a.trail.length > 18) a.trail.shift();
       }
     }
-    if (a.fading || this.mode === 'over') {
+    if (a.fading || this.mode === 'fired') {
       const alpha = Math.max(0, a.alpha);
       a.sprite.setAlpha(Math.min(a.sprite.alpha, alpha));
       a.shadow.setAlpha(Math.min(a.shadow.alpha, alpha * 0.28));
@@ -2170,13 +2287,13 @@ export class GameScene extends Phaser.Scene {
       if (strong) {
         const thr = rw.threshold();
         g.lineStyle(2, color, 0.5 + 0.3 * Math.sin(t * 8));
-        g.strokeCircle(thr.x, thr.y, ZONE_RADIUS);
+        g.strokeCircle(thr.x, thr.y, this.fx2.landingZone);
       }
     }
     for (const pad of this.airport.pads) {
       const active = dragDest === 'pad';
       g.lineStyle(2, KINDS.heli.color, active ? 0.6 + 0.4 * Math.sin(t * 8) : 0.25);
-      g.strokeCircle(pad.x, pad.y, ZONE_RADIUS + 4 + (active ? Math.sin(t * 8) * 2 : 0));
+      g.strokeCircle(pad.x, pad.y, this.fx2.landingZone + 4 + (active ? Math.sin(t * 8) * 2 : 0));
     }
 
     if (this.hasOutbound()) {

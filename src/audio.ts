@@ -72,6 +72,11 @@ export const sfx = {
     noise(0.08, 0.05);
     tone(1250, 0.05, 'sine', 0.03, 0.08);
   },
+  buy: () => {
+    tone(988, 0.08, 'triangle', 0.08);
+    tone(1319, 0.08, 'triangle', 0.08, 0.07);
+    tone(1976, 0.22, 'triangle', 0.07, 0.14);
+  },
   mayday: () => {
     for (let i = 0; i < 3; i++) {
       tone(880, 0.12, 'square', 0.04, i * 0.3);

@@ -40,6 +40,12 @@ export interface TerrainDef {
   roads: number[][];
 }
 
+/** Outline of a slot that can be built later, drawn as survey markings on the map. */
+export type Plot =
+  | { id: string; kind: 'runway'; a: [number, number]; b: [number, number]; width: number }
+  | { id: string; kind: 'pad'; x: number; y: number }
+  | { id: string; kind: 'rect'; x: number; y: number; w: number; h: number };
+
 export interface LayoutDef {
   name: string;
   theme: ThemeId;
@@ -53,6 +59,9 @@ export interface LayoutDef {
   /** Extra decorative taxiways. */
   links: [number, number][][];
   terrain: TerrainDef;
+  plots?: Plot[];
+  /** Where landing aircraft turn off the runway, as a fraction of its length. */
+  exitFrac?: number;
 }
 
 export const LAYOUTS: LayoutDef[] = [
@@ -274,12 +283,14 @@ export class Runway {
   readonly width: number;
   readonly taxiOff: number;
   readonly labels: [string, string];
+  readonly exitFrac: number;
   /** 0: aircraft land at A heading toward B. 1: the reverse. */
   active: 0 | 1 = 0;
   /** Aircraft currently on the runway surface. */
   readonly ground = new Set<object>();
 
-  constructor(def: RunwayDef) {
+  constructor(def: RunwayDef, exitFrac = EXIT_FRAC) {
+    this.exitFrac = exitFrac;
     this.size = def.size;
     [this.ax, this.ay] = def.a;
     [this.bx, this.by] = def.b;
@@ -346,7 +357,7 @@ export class Runway {
 
   /** The two high speed exits as [centerline s, taxiway s] for each landing direction. */
   exit(e: 0 | 1 = this.active): [number, number] {
-    const s = this.abs(this.length * EXIT_FRAC, e);
+    const s = this.abs(this.length * this.exitFrac, e);
     return [s, s + (e === 0 ? 28 : -28)];
   }
 }
@@ -434,7 +445,7 @@ export class Airport {
   readonly mouths: { x: number; y: number; runway: number; q: number }[];
 
   constructor(readonly def: LayoutDef) {
-    this.runways = def.runways.map((r) => new Runway(r));
+    this.runways = def.runways.map((r) => new Runway(r, def.exitFrac));
     this.pads = def.pads.map(([x, y]) => ({ x, y }));
     this.gates = def.gates.map((g) => new Gate(g.id, g.edge, g.at));
     const ap = def.apron;

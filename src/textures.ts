@@ -1,6 +1,6 @@
 import Phaser from 'phaser';
 import { W, H, KINDS, Kind, GREEN } from './config';
-import { Airport, Point, Runway, ThemeId } from './airport';
+import { Airport, Plot, Point, Runway, ThemeId } from './airport';
 
 /** All textures are drawn at 2x and displayed at half scale to stay crisp. */
 export const TEX_SCALE = 2;
@@ -515,6 +515,41 @@ function drawTower(c: Ctx, [x, y]: [number, number]) {
   circle(c, x, y, 4.5);
 }
 
+/** Dashed survey markings where a facility can be built. */
+export function tracePlot(c: Ctx, plot: Plot) {
+  c.beginPath();
+  if (plot.kind === 'pad') {
+    c.arc(plot.x, plot.y, 27, 0, Math.PI * 2);
+  } else if (plot.kind === 'rect') {
+    c.rect(plot.x, plot.y, plot.w, plot.h);
+  } else {
+    const [ax, ay] = plot.a;
+    const [bx, by] = plot.b;
+    const len = Math.hypot(bx - ax, by - ay);
+    const nx = (-(by - ay) / len) * (plot.width / 2 + 3);
+    const ny = ((bx - ax) / len) * (plot.width / 2 + 3);
+    c.moveTo(ax + nx, ay + ny);
+    c.lineTo(bx + nx, by + ny);
+    c.lineTo(bx - nx, by - ny);
+    c.lineTo(ax - nx, ay - ny);
+    c.closePath();
+  }
+}
+
+function drawPlots(c: Ctx, plots: Plot[]) {
+  c.save();
+  c.setLineDash([5, 5]);
+  c.lineWidth = 1.4;
+  c.strokeStyle = 'rgba(255,255,255,0.42)';
+  c.fillStyle = 'rgba(255,255,255,0.05)';
+  for (const p of plots) {
+    tracePlot(c, p);
+    c.fill();
+    c.stroke();
+  }
+  c.restore();
+}
+
 function drawBackground(c: Ctx, airport: Airport) {
   const def = airport.def;
   const theme = THEMES[def.theme];
@@ -695,6 +730,8 @@ function drawBackground(c: Ctx, airport: Airport) {
   c.stroke();
   c.setLineDash([]);
 
+  drawPlots(c, def.plots ?? []);
+
   const taxiways: Point[][] = [
     ...airport.runways.flatMap(runwayTaxiways),
     ...airport.mouths.map((m) => [{ x: m.x, y: m.y }, airport.runways[m.runway].taxi(m.q)]),
@@ -762,6 +799,111 @@ export function createTextures(scene: Phaser.Scene) {
       c.lineTo(20, y);
       c.stroke();
     }
+  });
+  make(scene, 'icon-runway', 48, 48, (c) => {
+    c.translate(24, 24);
+    c.rotate(-Math.PI / 4);
+    c.fillStyle = '#7c8189';
+    c.fillRect(-22, -8, 44, 16);
+    c.fillStyle = '#3a3e45';
+    c.fillRect(-20, -6, 40, 12);
+    c.fillStyle = '#ffffff';
+    for (let x = -12; x < 12; x += 7) c.fillRect(x, -0.8, 4, 1.6);
+    for (const x of [-19, 15]) for (let y = -4; y <= 2; y += 3) c.fillRect(x, y, 4, 1.4);
+  });
+  make(scene, 'icon-pad', 48, 48, (c) => {
+    c.fillStyle = '#7c8189';
+    circle(c, 24, 24, 20);
+    c.fillStyle = '#3d4249';
+    circle(c, 24, 24, 17);
+    c.strokeStyle = KINDS.heli.css;
+    c.lineWidth = 2;
+    c.beginPath();
+    c.arc(24, 24, 13, 0, Math.PI * 2);
+    c.stroke();
+    c.fillStyle = '#ffffff';
+    c.font = '800 15px Rubik, sans-serif';
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillText('H', 24, 25);
+  });
+  make(scene, 'icon-terminal', 48, 48, (c) => {
+    c.fillStyle = '#8a8f96';
+    c.fillRect(3, 14, 42, 28);
+    c.fillStyle = '#d8dde3';
+    c.fillRect(6, 10, 36, 14);
+    c.fillStyle = '#b9c0c8';
+    for (let x = 9; x < 40; x += 7) c.fillRect(x, 13, 4, 8);
+    c.fillStyle = '#5fa8d3';
+    c.fillRect(6, 23, 36, 2);
+    c.strokeStyle = 'rgba(255,214,70,0.9)';
+    c.lineWidth = 1.4;
+    for (const x of [13, 24, 35]) {
+      c.beginPath();
+      c.moveTo(x, 27);
+      c.lineTo(x, 39);
+      c.stroke();
+    }
+  });
+  make(scene, 'icon-radar', 48, 48, (c) => {
+    c.strokeStyle = 'rgba(94,224,138,0.9)';
+    c.lineWidth = 2;
+    for (const r of [8, 15, 21]) {
+      c.beginPath();
+      c.arc(24, 24, r, 0, Math.PI * 2);
+      c.stroke();
+    }
+    const g = c.createLinearGradient(24, 24, 44, 10);
+    g.addColorStop(0, 'rgba(94,224,138,0.9)');
+    g.addColorStop(1, 'rgba(94,224,138,0)');
+    c.fillStyle = g;
+    c.beginPath();
+    c.moveTo(24, 24);
+    c.arc(24, 24, 21, -Math.PI / 2, -Math.PI / 8);
+    c.closePath();
+    c.fill();
+    c.fillStyle = '#ffffff';
+    circle(c, 33, 15, 2.2);
+  });
+  make(scene, 'icon-ils', 48, 48, (c) => {
+    c.strokeStyle = '#ffc93c';
+    c.lineCap = 'round';
+    c.lineJoin = 'round';
+    c.lineWidth = 3.4;
+    for (const y of [12, 22, 32]) {
+      c.beginPath();
+      c.moveTo(12, y);
+      c.lineTo(24, y + 9);
+      c.lineTo(36, y);
+      c.stroke();
+    }
+  });
+  make(scene, 'icon-exit', 48, 48, (c) => {
+    c.fillStyle = '#3a3e45';
+    c.fillRect(6, 30, 36, 12);
+    c.strokeStyle = 'rgba(255,214,70,0.95)';
+    c.lineWidth = 3;
+    c.lineCap = 'round';
+    c.lineJoin = 'round';
+    c.beginPath();
+    c.moveTo(10, 36);
+    c.lineTo(24, 36);
+    c.quadraticCurveTo(34, 36, 36, 16);
+    c.stroke();
+    c.beginPath();
+    c.moveTo(30, 20);
+    c.lineTo(36, 12);
+    c.lineTo(41, 21);
+    c.stroke();
+  });
+  make(scene, 'icon-cash', 48, 48, (c) => {
+    c.fillStyle = '#5ee08a';
+    circle(c, 24, 24, 19);
+    c.fillStyle = '#0b1410';
+    c.font = '800 24px Rubik, sans-serif';
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillText('$', 24, 26);
   });
   make(scene, 'icon-fuel', 48, 48, (c) => {
     // Fuel gauge with the needle on empty.
