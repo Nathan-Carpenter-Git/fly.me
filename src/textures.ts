@@ -763,6 +763,29 @@ export function createTextures(scene: Phaser.Scene) {
       c.stroke();
     }
   });
+  make(scene, 'icon-fuel', 48, 48, (c) => {
+    // Fuel gauge with the needle on empty.
+    c.lineCap = 'round';
+    c.strokeStyle = 'rgba(255,255,255,0.25)';
+    c.lineWidth = 5;
+    c.beginPath();
+    c.arc(24, 30, 17, Math.PI, Math.PI * 2);
+    c.stroke();
+    c.strokeStyle = '#ff5d4f';
+    c.beginPath();
+    c.arc(24, 30, 17, Math.PI, Math.PI * 1.3);
+    c.stroke();
+    c.strokeStyle = '#ffb020';
+    c.lineWidth = 3;
+    c.beginPath();
+    c.moveTo(24, 30);
+    c.lineTo(24 + Math.cos(Math.PI * 1.15) * 15, 30 + Math.sin(Math.PI * 1.15) * 15);
+    c.stroke();
+    c.fillStyle = '#e8f0ea';
+    c.beginPath();
+    c.arc(24, 30, 3.5, 0, Math.PI * 2);
+    c.fill();
+  });
   make(scene, 'icon-wind', 48, 48, (c) => {
     c.strokeStyle = '#e8f0ea';
     c.lineCap = 'round';

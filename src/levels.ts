@@ -1,7 +1,7 @@
 import { Kind } from './config';
 import { LAYOUTS } from './airport';
 
-export type Feature = 'fast' | 'heavy' | 'transit' | 'wind' | 'depart';
+export type Feature = 'fast' | 'heavy' | 'transit' | 'wind' | 'depart' | 'fuel';
 
 export interface LevelDef {
   number: number;
@@ -18,13 +18,19 @@ export interface LevelDef {
   maxAir: [number, number];
   mix: Partial<Record<Kind, number>>;
   fastChance: number;
+  /** Chance that an arrival declares a fuel emergency. */
+  fuelChance: number;
   windEvery: [number, number];
   departEvery: [number, number];
 }
 
-const ALL: Feature[] = ['fast', 'heavy', 'transit', 'wind', 'depart'];
+const ALL: Feature[] = ['fast', 'heavy', 'transit', 'wind', 'depart', 'fuel'];
 
-const BASE = { windEvery: [40, 55] as [number, number], departEvery: [15, 22] as [number, number] };
+const BASE = {
+  windEvery: [40, 55] as [number, number],
+  departEvery: [15, 22] as [number, number],
+  fuelChance: 0,
+};
 
 const HAND_MADE: Omit<LevelDef, 'number'>[] = [
   {
@@ -97,6 +103,8 @@ const HAND_MADE: Omit<LevelDef, 'number'>[] = [
     mix: { jet: 0.3, heavy: 0.12, prop: 0.25, heli: 0.15, transit: 0.18 },
     fastChance: 0.25,
     departEvery: [9, 14],
+    introduces: 'fuel',
+    fuelChance: 0.14,
   },
   {
     ...BASE,
@@ -108,6 +116,7 @@ const HAND_MADE: Omit<LevelDef, 'number'>[] = [
     maxAir: [5, 7.2],
     mix: { jet: 0.28, heavy: 0.14, prop: 0.22, heli: 0.16, transit: 0.2 },
     fastChance: 0.28,
+    fuelChance: 0.14,
   },
 ];
 
@@ -126,6 +135,7 @@ export function getLevel(index: number): LevelDef {
     spawn: [Math.max(3.2, 5 - 0.25 * k), Math.max(2, 3 - 0.15 * k)],
     maxAir: [5, Math.min(10, 7.2 + 0.5 * k)],
     fastChance: Math.min(0.5, 0.28 + 0.04 * k),
+    fuelChance: Math.min(0.25, 0.14 + 0.02 * k),
     windEvery: [Math.max(25, 40 - 2 * k), Math.max(35, 55 - 2 * k)],
     departEvery: [Math.max(8, 13 - k), Math.max(12, 19 - k)],
   };

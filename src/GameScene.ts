@@ -14,6 +14,10 @@ import {
   FONT,
   GREEN,
   GREEN_CSS,
+  FARES,
+  EMERGENCY_BONUS,
+  STREAK_WINDOW,
+  money,
 } from './config';
 import { Airport, Gate, LAYOUTS, Point, Runway, Stand, EXIT_FRAC } from './airport';
 import { Feature, LevelDef, getLevel, HAND_MADE_COUNT } from './levels';
@@ -65,6 +69,17 @@ interface Aircraft {
   phase: number;
   trail: { x: number; y: number; h: number }[];
   trailT: number;
+  callsign: string;
+  label: Phaser.GameObjects.Text;
+  /** Seconds of fuel left during an emergency; fuelMax is 0 for normal flights. */
+  fuel: number;
+  fuelMax: number;
+  /** How cleanly the final approach lined up with the runway. */
+  grade: 'greased' | 'smooth' | null;
+  /** Recent positions, used to judge the approach. */
+  hist: Point[];
+  /** A helicopter hovering short of a busy helipad. */
+  holding: boolean;
 }
 
 interface Conflict {
@@ -109,6 +124,10 @@ interface Button {
   text: Phaser.GameObjects.Text;
 }
 const MUSIC_KEY = 'flyme.music';
+const FAST_FORWARD = 3;
+const RADIO_LINES = 3;
+const AIRLINES = ['FLY', 'SKY', 'NOVA', 'ORCA', 'JET', 'AERO', 'LARK', 'PIKE'];
+const HELI_CALLS = ['HELI', 'MEDIC', 'RANGER'];
 const AMBER = 0xffb020;
 /** How far ahead collision prediction looks, and its time step, in seconds. */
 const PREDICT_SECONDS = 6;
@@ -190,6 +209,17 @@ export class GameScene extends Phaser.Scene {
   private musicBtn!: Button;
   private levelPanel!: Phaser.GameObjects.Graphics;
   private director = new Director();
+  private speedBtn!: Button;
+  private speedMul = 1;
+  private streak = 0;
+  private streakLeft = 0;
+  private streakG!: Phaser.GameObjects.Graphics;
+  private streakText!: Phaser.GameObjects.Text;
+  private statPanel!: Phaser.GameObjects.Graphics;
+  private scoreLabel!: Phaser.GameObjects.Text;
+  private bestLabel!: Phaser.GameObjects.Text;
+  private radioLines: Phaser.GameObjects.Text[] = [];
+  private lastRadioSfx = 0;
   private trackText!: Phaser.GameObjects.Text;
   private clouds: Phaser.GameObjects.Image[] = [];
   private scoreText!: Phaser.GameObjects.Text;
@@ -253,15 +283,15 @@ export class GameScene extends Phaser.Scene {
   }
 
   private buildHud() {
-    const panel = this.add.graphics().setDepth(99);
-    panel.fillStyle(0x0b1410, 0.6);
-    panel.fillRoundedRect(16, 14, 150, 58, 12);
-    panel.fillRoundedRect(W - 136, 14, 120, 58, 12);
+    this.statPanel = this.add.graphics().setDepth(99);
 
-    this.text(30, 22, 'SCORE', 12, '#a9c4b4').setLetterSpacing(2);
-    this.scoreText = this.text(30, 36, '0', 28, '#ffffff', 800);
-    this.text(W - 122, 22, 'BEST', 12, '#a9c4b4').setLetterSpacing(2);
-    this.bestText = this.text(W - 122, 36, String(this.best), 28, '#ffffff', 800);
+    this.scoreLabel = this.text(30, 22, 'EARNED', 12, '#a9c4b4').setLetterSpacing(2);
+    this.scoreText = this.text(30, 36, money(0), 28, '#ffffff', 800);
+    this.bestLabel = this.text(0, 22, 'BEST', 12, '#a9c4b4').setLetterSpacing(2);
+    this.bestText = this.text(0, 36, money(this.best), 28, '#ffffff', 800);
+    this.layoutStatPanels();
+    this.streakG = this.add.graphics().setDepth(99);
+    this.streakText = this.text(30, 93, '', 13, '#ffc93c', 800).setOrigin(0, 0.5).setLetterSpacing(1);
 
     this.levelPanel = this.add.graphics().setDepth(99);
     this.levelText = this.text(W / 2, 22, '', 12, '#a9c4b4').setOrigin(0.5, 0).setLetterSpacing(2);
@@ -271,6 +301,8 @@ export class GameScene extends Phaser.Scene {
     this.skipBtn = this.makeButton(80, 'Skip level  ·  N');
     this.musicBtn = this.makeButton(112, '');
     this.updateMusicLabel();
+    this.speedBtn = this.makeButton(144, '');
+    this.setSpeed(1);
     this.trackText = this.text(W - 24, H - 30, '', 13, '#cfe0d6', 500)
       .setOrigin(1, 0.5)
       .setStroke('#0b1410', 4)
@@ -343,6 +375,90 @@ export class GameScene extends Phaser.Scene {
     bg.fillRoundedRect(16, H - 46, x - 16 + 4, 32, 10);
   }
 
+  /** Money panels size to their values so large amounts never overflow. */
+  private layoutStatPanels() {
+    const g = this.statPanel;
+    g.clear();
+    g.fillStyle(0x0b1410, 0.6);
+    const leftW = Math.max(150, Math.ceil(Math.max(this.scoreText.width, this.scoreLabel.width)) + 28);
+    g.fillRoundedRect(16, 14, leftW, 58, 12);
+    const rightW = Math.max(120, Math.ceil(Math.max(this.bestText.width, this.bestLabel.width)) + 28);
+    g.fillRoundedRect(W - 16 - rightW, 14, rightW, 58, 12);
+    this.bestLabel.setX(W - 16 - rightW + 14);
+    this.bestText.setX(W - 16 - rightW + 14);
+  }
+
+  private setSpeed(mul: number) {
+    this.speedMul = mul;
+    this.setButtonLabel(this.speedBtn, mul > 1 ? `Speed ${mul}x  ·  F` : 'Speed 1x  ·  F');
+    this.speedBtn.text.setColor(mul > 1 ? '#ffc93c' : '#cfe0d6');
+  }
+
+  /** Drops back to normal speed when something needs the player's attention. */
+  private slowDown() {
+    if (this.speedMul > 1) this.setSpeed(1);
+  }
+
+  private drawStreak() {
+    const g = this.streakG;
+    g.clear();
+    if (this.streak < 2 || this.mode !== 'play') {
+      this.streakText.setVisible(false);
+      return;
+    }
+    this.streakText.setVisible(true).setText(`STREAK  x${this.multiplier().toFixed(2).replace(/\.?0+$/, '')}`);
+    const w = Math.max(150, Math.ceil(this.streakText.width) + 28);
+    g.fillStyle(0x0b1410, 0.6);
+    g.fillRoundedRect(16, 80, w, 30, 10);
+    g.fillStyle(0xffc93c, 0.85);
+    g.fillRoundedRect(28, 104, (w - 24) * (this.streakLeft / STREAK_WINDOW), 3, 1.5);
+  }
+
+  private multiplier() {
+    return Math.min(3, 1 + 0.25 * Math.max(0, this.streak - 1));
+  }
+
+  // ---------------------------------------------------------------- radio
+
+  private radio(msg: string) {
+    if (this.mode !== 'play') return;
+    for (const line of this.radioLines) line.y -= 19;
+    const line = this.text(W - 24, H - 56, msg, 13, '#e8f0ea', 500).setOrigin(1, 0.5).setStroke('#0b1410', 4);
+    this.radioLines.push(line);
+    while (this.radioLines.length > RADIO_LINES) this.radioLines.shift()!.destroy();
+    this.tweens.add({
+      targets: line,
+      alpha: 0,
+      delay: 5000,
+      duration: 800,
+      onComplete: () => {
+        this.radioLines = this.radioLines.filter((l) => l !== line);
+        line.destroy();
+      },
+    });
+    if (this.time.now - this.lastRadioSfx > 350) {
+      this.lastRadioSfx = this.time.now;
+      sfx.radio();
+    }
+  }
+
+  private clearRadio() {
+    for (const l of this.radioLines) l.destroy();
+    this.radioLines = [];
+  }
+
+  private makeCallsign(kind: Kind) {
+    const pick = <T,>(arr: T[]) => arr[Math.floor(Math.random() * arr.length)];
+    for (let i = 0; i < 20; i++) {
+      let cs: string;
+      if (kind === 'prop') cs = `N${10 + Math.floor(Math.random() * 990)}${pick(['K', 'M', 'T', 'X', 'Z'])}`;
+      else if (kind === 'heli') cs = `${pick(HELI_CALLS)} ${1 + Math.floor(Math.random() * 30)}`;
+      else cs = `${pick(AIRLINES)} ${10 + Math.floor(Math.random() * 890)}`;
+      if (!this.planes.some((a) => a.callsign === cs)) return cs;
+    }
+    return `FLY ${Math.floor(Math.random() * 9000) + 1000}`;
+  }
+
   private updateMusicLabel() {
     this.setButtonLabel(this.musicBtn, `Music ${this.music.isEnabled ? 'on' : 'off'}  ·  M`);
   }
@@ -384,7 +500,8 @@ export class GameScene extends Phaser.Scene {
 
   private setScore(v: number) {
     this.score = v;
-    this.scoreText.setText(String(v));
+    this.scoreText.setText(money(v));
+    this.layoutStatPanels();
   }
 
   private showBanner(msg: string, color = '#ffffff', hold = 1800) {
@@ -575,6 +692,7 @@ export class GameScene extends Phaser.Scene {
     if (mix.transit) list.push(plane('transit', 'Overflights', isNew('transit')));
     if (lv.features.has('fast')) list.push({ icon: 'icon-fast', rotate: true, label: 'Fast planes', isNew: isNew('fast') });
     if (lv.features.has('wind')) list.push({ icon: 'icon-wind', label: 'Wind shifts', isNew: isNew('wind') });
+    if (lv.features.has('fuel')) list.push({ icon: 'icon-fuel', label: 'Fuel emergencies', isNew: isNew('fuel') });
     return list.sort((a, b) => Number(!!b.isNew) - Number(!!a.isNew));
   }
 
@@ -662,6 +780,10 @@ export class GameScene extends Phaser.Scene {
     this.pauseText.setVisible(false);
     this.levelStartScore = this.score;
     this.director.reset();
+    this.streak = 0;
+    this.streakLeft = 0;
+    this.clearRadio();
+    this.setSpeed(1);
     this.buildLegend();
     this.updateProgress();
   }
@@ -689,6 +811,7 @@ export class GameScene extends Phaser.Scene {
     if (this.mode !== 'play') return;
     this.mode = 'complete';
     this.dragging = null;
+    this.setSpeed(1);
     this.time0 = this.time.now;
     sfx.levelUp();
     this.saveBest();
@@ -697,8 +820,8 @@ export class GameScene extends Phaser.Scene {
         kicker: `LEVEL ${this.level.number}`,
         title: 'Cleared',
         stats: [
-          ['SCORE', String(this.score)],
-          ['BEST', String(this.best)],
+          ['EARNED', money(this.score)],
+          ['BEST', money(this.best)],
         ],
         prompt: 'Click for the next level',
       }),
@@ -708,30 +831,32 @@ export class GameScene extends Phaser.Scene {
   private saveBest() {
     if (this.score <= this.best) return false;
     this.best = this.score;
-    this.bestText.setText(String(this.best));
+    this.bestText.setText(money(this.best));
+    this.layoutStatPanels();
     save(BEST_KEY, this.best);
     return true;
   }
 
-  private gameOver(a: Aircraft, b: Aircraft) {
+  private gameOver(a: Aircraft, b: Aircraft | null, title = 'Crash') {
     if (this.mode !== 'play') return;
     this.mode = 'over';
     this.dragging = null;
+    this.setSpeed(1);
     this.time0 = this.time.now;
     sfx.crash();
-    this.explode((a.x + b.x) / 2, (a.y + b.y) / 2);
-    for (const p of [a, b]) {
-      const parts = [p.sprite, p.shadow, p.rotor, p.rotorShadow, p.tag].filter(Boolean);
+    this.explode(b ? (a.x + b.x) / 2 : a.x, b ? (a.y + b.y) / 2 : a.y);
+    for (const p of b ? [a, b] : [a]) {
+      const parts = [p.sprite, p.shadow, p.rotor, p.rotorShadow, p.tag, p.label].filter(Boolean);
       this.tweens.add({ targets: parts, alpha: 0, duration: 400 });
     }
     const newBest = this.saveBest();
     this.time.delayedCall(1100, () =>
       this.showCard({
         kicker: `LEVEL ${this.level.number}  ·  ${this.airport.def.name.toUpperCase()}`,
-        title: 'Crash',
+        title,
         stats: [
-          ['SCORE', String(this.score)],
-          [newBest ? 'NEW BEST' : 'BEST', String(this.best)],
+          ['EARNED', money(this.score)],
+          [newBest ? 'NEW BEST' : 'BEST', money(this.best)],
         ],
         prompt: 'Click to retry',
       }),
@@ -769,6 +894,7 @@ export class GameScene extends Phaser.Scene {
     this.seen.add(key);
     save(SEEN_KEY, [...this.seen]);
     this.dragging = null;
+    this.slowDown();
     sfx.coach();
     this.coach.show({ key, ...msg });
   }
@@ -829,6 +955,15 @@ export class GameScene extends Phaser.Scene {
           focus,
         });
       }
+      if (a.fuelMax > 0) {
+        this.tutorial('fuel', {
+          kicker: 'MAYDAY',
+          title: 'Low fuel',
+          text: 'The ring shows the fuel left. Land it before the ring runs out.',
+          color: '#ffb020',
+          focus,
+        });
+      }
       if (a.kind === 'heavy') {
         this.tutorial('heavy', {
           kicker: 'NEW',
@@ -862,6 +997,10 @@ export class GameScene extends Phaser.Scene {
       this.music.start();
       const x = p.worldX;
       const y = p.worldY;
+      if (this.mode === 'play' && this.hit(this.speedBtn, x, y)) {
+        this.setSpeed(this.speedMul > 1 ? 1 : FAST_FORWARD);
+        return;
+      }
       if (this.hit(this.musicBtn, x, y)) {
         this.toggleMusic();
         return;
@@ -919,6 +1058,9 @@ export class GameScene extends Phaser.Scene {
     const kb = this.input.keyboard;
     kb?.on('keydown-P', () => this.togglePause());
     kb?.on('keydown-M', () => this.toggleMusic());
+    kb?.on('keydown-F', () => {
+      if (this.mode === 'play') this.setSpeed(this.speedMul > 1 ? 1 : FAST_FORWARD);
+    });
     kb?.on('keydown-SPACE', () => this.togglePause());
     kb?.on('keydown-N', () => {
       if (this.mode === 'play' || this.mode === 'intro' || this.mode === 'complete') {
@@ -973,6 +1115,7 @@ export class GameScene extends Phaser.Scene {
       a.route = this.airport.departureRoute(a.stand!);
       a.stand!.occupant = null;
       sfx.taxi();
+      this.radio(`${a.callsign}, taxi to runway ${rw.labels[rw.active]}`);
       return;
     }
     // Holding short: clear for takeoff only if nothing is on or landing on the runway.
@@ -987,6 +1130,7 @@ export class GameScene extends Phaser.Scene {
     rw.ground.add(a);
     a.onRunway = true;
     sfx.taxi();
+    this.radio(`${a.callsign}, cleared for takeoff runway ${rw.labels[a.end]}`);
   }
 
   private extendPath(a: Aircraft, raw: Point) {
@@ -1031,6 +1175,9 @@ export class GameScene extends Phaser.Scene {
     else a.path.push(lock.gate.exitPoint(pt));
     this.dragging = null;
     sfx.lock();
+    if (lock.type === 'runway') this.radio(`${a.callsign}, cleared to land runway ${lock.rw.labels[lock.rw.active]}`);
+    else if (lock.type === 'pad') this.radio(`${a.callsign}, cleared to land helipad`);
+    else this.radio(`${a.callsign}, cleared out via exit ${lock.gate.id}`);
     return true;
   }
 
@@ -1095,7 +1242,16 @@ export class GameScene extends Phaser.Scene {
       phase: Math.random() * 10,
       trail: [],
       trailT: 0,
+      callsign: '',
+      label: null as unknown as Phaser.GameObjects.Text,
+      fuel: 0,
+      fuelMax: 0,
+      grade: null,
+      hist: [],
+      holding: false,
     };
+    a.callsign = this.makeCallsign(kind);
+    a.label = this.text(x, y, a.callsign, 10, '#e8f0ea', 700).setOrigin(0.5, 0).setStroke('#0b1410', 3).setAlpha(0.85).setDepth(22);
     if (kind === 'heli') {
       a.rotorShadow = this.add.image(x, y, 'rotor').setScale(1 / TEX_SCALE).setTint(0x000000).setAlpha(0.2).setDepth(10);
       a.rotor = this.add.image(x, y, 'rotor').setScale(1 / TEX_SCALE).setDepth(21);
@@ -1116,7 +1272,7 @@ export class GameScene extends Phaser.Scene {
   private trafficLoad() {
     let load = 0;
     for (const a of this.planes) {
-      if (a.state === 'flying') load += a.target ? 0.6 : 1;
+      if (a.state === 'flying') load += (a.target ? 0.6 : 1) + (a.fuelMax > 0 ? 0.5 : 0);
       else if (a.state === 'parked' || a.state === 'taxi' || a.state === 'hold') load += 0.35;
       else if (a.state !== 'gone') load += 0.25;
     }
@@ -1171,6 +1327,21 @@ export class GameScene extends Phaser.Scene {
     if (gate) this.assignGate(a, gate);
     this.planes.push(a);
     sfx.incoming();
+    const emergencyActive = this.planes.some((p) => p.fuelMax > 0 && p.state === 'flying');
+    if (
+      this.level.features.has('fuel') &&
+      KINDS[kind].dest !== 'gate' &&
+      !emergencyActive &&
+      this.trafficLoad() < this.capacity() - 1 &&
+      Math.random() < this.level.fuelChance
+    ) {
+      // Enough fuel for a direct approach with room to spare, but not for wandering.
+      const reach = Math.hypot(aim.x - e.x, aim.y - e.y) / a.speed;
+      a.fuelMax = a.fuel = Phaser.Math.Clamp(reach * 2.4 + 16, 32, 65);
+      sfx.mayday();
+      this.slowDown();
+      this.radio(`MAYDAY, ${a.callsign}, low fuel`);
+    }
     return true;
   }
 
@@ -1212,6 +1383,7 @@ export class GameScene extends Phaser.Scene {
     a.rotor?.destroy();
     a.rotorShadow?.destroy();
     a.tag?.destroy();
+    a.label.destroy();
     if (a.rw) a.rw.ground.delete(a);
     if (a.stand?.occupant === a) a.stand.occupant = null;
   }
@@ -1232,44 +1404,55 @@ export class GameScene extends Phaser.Scene {
 
     const running = this.mode === 'play' && !this.paused && !this.coach.visible;
     if (running) {
-      this.elapsed += dt;
-      const lv = this.level;
-      this.director.update(dt);
-      this.spawnIn -= dt;
-      if (this.spawnIn <= 0) {
-        // When the director holds an arrival back, check again shortly.
-        this.spawnIn = this.spawnArrival()
-          ? Phaser.Math.Linear(lv.spawn[0], lv.spawn[1], this.progress()) * (0.8 + Math.random() * 0.4)
-          : 1;
-      }
-      if (lv.features.has('depart')) {
-        this.departIn -= dt;
-        if (this.departIn <= 0) {
-          this.spawnDeparture();
-          this.departIn = rand(lv.departEvery);
-        }
-      }
-      if (lv.features.has('wind')) this.updateWind(dt);
-      for (const a of this.planes) {
-        if (this.mode !== 'play') break;
-        this.step(a, dt);
-      }
-      for (const a of this.planes) if (a.state === 'gone') this.destroyPlane(a);
-      this.planes = this.planes.filter((a) => a.state !== 'gone');
-      if (this.mode === 'play') this.checkConflicts();
-      if (this.mode === 'play') this.predictConflicts();
-      if (this.mode === 'play') this.checkTutorials();
+      // Fast forward runs extra simulation steps rather than one big step, so nothing tunnels.
+      for (let i = 0; i < this.speedMul && this.mode === 'play' && !this.coach.visible; i++) this.simulate(dt);
     }
 
-    for (const a of this.planes) this.syncSprites(a, running ? dt : 0);
+    for (const a of this.planes) this.syncSprites(a, running ? dt * this.speedMul : 0);
     this.drawFx();
+    this.drawStreak();
     this.coach.draw();
+  }
+
+  private simulate(dt: number) {
+    this.elapsed += dt;
+    const lv = this.level;
+    this.director.update(dt);
+    if (this.streakLeft > 0) {
+      this.streakLeft = Math.max(0, this.streakLeft - dt);
+      if (this.streakLeft === 0) this.streak = 0;
+    }
+    this.spawnIn -= dt;
+    if (this.spawnIn <= 0) {
+      // When the director holds an arrival back, check again shortly.
+      this.spawnIn = this.spawnArrival()
+        ? Phaser.Math.Linear(lv.spawn[0], lv.spawn[1], this.progress()) * (0.8 + Math.random() * 0.4)
+        : 1;
+    }
+    if (lv.features.has('depart')) {
+      this.departIn -= dt;
+      if (this.departIn <= 0) {
+        this.spawnDeparture();
+        this.departIn = rand(lv.departEvery);
+      }
+    }
+    if (lv.features.has('wind')) this.updateWind(dt);
+    for (const a of this.planes) {
+      if (this.mode !== 'play') break;
+      this.step(a, dt);
+    }
+    for (const a of this.planes) if (a.state === 'gone') this.destroyPlane(a);
+    this.planes = this.planes.filter((a) => a.state !== 'gone');
+    if (this.mode === 'play') this.checkConflicts();
+    if (this.mode === 'play') this.predictConflicts();
+    if (this.mode === 'play') this.checkTutorials();
   }
 
   private updateWind(dt: number) {
     this.windIn -= dt;
     if (!this.windWarned && this.windIn <= 5) {
       this.windWarned = true;
+      this.slowDown();
       sfx.wind();
       this.showBanner('Wind shift in 5', '#ffc93c', 3000);
       const rw = this.airport.runways[0];
@@ -1402,6 +1585,26 @@ export class GameScene extends Phaser.Scene {
   }
 
   private stepFlying(a: Aircraft, dt: number) {
+    if (a.fuelMax > 0) {
+      a.fuel -= dt;
+      if (a.fuel <= 0) {
+        this.gameOver(a, null, 'Out of fuel');
+        return;
+      }
+    }
+    const last = a.hist[a.hist.length - 1];
+    if (!last || dist(last, a) >= 6) {
+      a.hist.push({ x: a.x, y: a.y });
+      if (a.hist.length > 14) a.hist.shift();
+    }
+    // Helicopters hover short of a helipad that another one is still landing on.
+    const pad = a.target?.type === 'pad' ? a.target.pad : null;
+    if (pad && dist(a, pad) < 60 && this.padBusy(pad, a)) {
+      if (!a.holding) this.radio(`${a.callsign}, holding for the helipad`);
+      a.holding = true;
+      return;
+    }
+    a.holding = false;
     let d = a.speed * dt;
     while (d > 0 && a.path.length) {
       const p = a.path[0];
@@ -1450,6 +1653,12 @@ export class GameScene extends Phaser.Scene {
     if ((a.y < EDGE && cy < 0) || (a.y > H - EDGE && cy > 0)) a.heading = Math.atan2(-cy, cx);
   }
 
+  private padBusy(pad: Point, except: Aircraft) {
+    return this.planes.some(
+      (p) => p !== except && p.state === 'final' && p.target?.type === 'pad' && p.target.pad === pad && p.alt > 0,
+    );
+  }
+
   private runwayBusy(rw: Runway, except?: Aircraft) {
     return rw.ground.size > 0 || this.planes.some((p) => p !== except && p.state === 'final' && p.rw === rw);
   }
@@ -1462,19 +1671,34 @@ export class GameScene extends Phaser.Scene {
     sfx.goAround();
     this.director.bump(1);
     this.popText(a.x, a.y, 'Go around', '#ffc93c');
+    this.radio(`${a.callsign}, going around`);
   }
 
   private exitGate(a: Aircraft) {
     a.state = 'gone';
     if (a.kind === 'depart') this.departed++;
     else this.handled++;
-    this.setScore(this.score + 1);
-    sfx.exit();
     const c = a.gate!.center(46);
-    this.popText(c.x, c.y, '+1', GREEN_CSS);
-    this.bumpScore();
+    this.earn(a, c);
+    sfx.exit();
     this.updateProgress();
     this.checkComplete();
+  }
+
+  /** Pays out for a handled aircraft: fare, streak multiplier, approach bonus and emergency bonus. */
+  private earn(a: Aircraft, at: Point) {
+    this.streak = this.streakLeft > 0 ? this.streak + 1 : 1;
+    this.streakLeft = STREAK_WINDOW;
+    const gradeMult = a.grade === 'greased' ? 1.5 : a.grade === 'smooth' ? 1.2 : 1;
+    const emergency = a.fuelMax > 0 ? EMERGENCY_BONUS : 0;
+    const amount = Math.round((FARES[a.kind] * this.multiplier() * gradeMult + emergency) / 10) * 10;
+    this.setScore(this.score + amount);
+    this.bumpScore();
+    this.popText(at.x, at.y, `+${money(amount)}`, emergency ? '#ffb020' : KINDS[a.kind].css);
+    if (a.grade) {
+      this.popText(at.x, at.y - 22, a.grade === 'greased' ? 'Greased it!' : 'Smooth', '#ffffff');
+      if (a.grade === 'greased') sfx.greased();
+    }
   }
 
   private bumpScore() {
@@ -1497,6 +1721,12 @@ export class GameScene extends Phaser.Scene {
     a.end = rw.active;
     const thr = rw.threshold(a.end);
     const ang = rw.angle(a.end);
+    // Judge the approach by the track over roughly the last 50 px before the threshold.
+    const back = a.hist.find((p) => dist(p, thr) <= 60) ?? a.hist[0];
+    if (back && dist(back, thr) > 20) {
+      const dev = Math.abs(Angle.Wrap(Math.atan2(thr.y - back.y, thr.x - back.x) - ang));
+      a.grade = dev < Phaser.Math.DegToRad(8) ? 'greased' : dev < Phaser.Math.DegToRad(18) ? 'smooth' : null;
+    }
     const dx = Math.cos(ang);
     const dy = Math.sin(ang);
     const rx = a.x - thr.x;
@@ -1574,10 +1804,9 @@ export class GameScene extends Phaser.Scene {
 
   private scoreLanding(a: Aircraft) {
     this.handled++;
-    this.setScore(this.score + 1);
-    this.bumpScore();
-    sfx.land();
-    this.popText(a.x, a.y, '+1', KINDS[a.kind].css);
+    this.earn(a, a);
+    sfx.land(this.streak);
+    if (a.fuelMax > 0) this.radio(`${a.callsign}, on the ground, thank you`);
     this.updateProgress();
     this.checkComplete();
   }
@@ -1644,7 +1873,10 @@ export class GameScene extends Phaser.Scene {
         }
       }
     }
-    if (newWarn) this.director.bump(1);
+    if (newWarn) {
+      this.director.bump(1);
+      this.slowDown();
+    }
     if (newWarn && this.time.now - this.lastWarnSfx > 900) {
       this.lastWarnSfx = this.time.now;
       sfx.warn();
@@ -1661,6 +1893,7 @@ export class GameScene extends Phaser.Scene {
     const path = a.state === 'flying' ? a.path : [];
     const landing = a.target !== null && a.target.type !== 'gate';
     const steps = PREDICT_SECONDS / PREDICT_STEP;
+    if (a.holding) return Array.from({ length: steps }, () => ({ x, y }));
     for (let i = 0; i < steps; i++) {
       let d = a.speed * PREDICT_STEP;
       while (d > 0 && idx < path.length) {
@@ -1715,7 +1948,10 @@ export class GameScene extends Phaser.Scene {
     const fresh = [...keys].some((k) => !this.conflictKeys.has(k));
     this.conflicts = found;
     this.conflictKeys = keys;
-    if (fresh) this.director.bump(0.6);
+    if (fresh) {
+      this.director.bump(0.6);
+      this.slowDown();
+    }
     if (fresh && this.time.now - this.lastConflictSfx > 1200) {
       this.lastConflictSfx = this.time.now;
       sfx.conflict();
@@ -1772,6 +2008,9 @@ export class GameScene extends Phaser.Scene {
       a.rotorShadow.setPosition(a.shadow.x, a.shadow.y).setRotation(a.rotor.rotation).setScale(s);
     }
     a.tag?.setPosition(a.x + 15, a.y - 15);
+    a.label.setPosition(a.x, a.y + (a.kind === 'heavy' ? 24 : 18));
+    a.label.setAlpha(Math.min(0.85, a.sprite.alpha));
+    if (a.fuelMax > 0) a.label.setColor('#ffb020');
   }
 
   // ---------------------------------------------------------------- drawing
@@ -2054,6 +2293,19 @@ export class GameScene extends Phaser.Scene {
         );
         g.lineStyle(2, color, pulse * 0.6);
         g.strokeCircle(ex, ey, 16);
+      }
+
+      if (a.fuelMax > 0) {
+        // Fuel ring drains clockwise and turns red when it is nearly empty.
+        const frac = Math.max(0, a.fuel / a.fuelMax);
+        const low = frac < 0.3;
+        const r = a.kind === 'heavy' ? 26 : 20;
+        g.lineStyle(3, 0x0b1410, 0.45);
+        g.strokeCircle(a.x, a.y, r);
+        g.lineStyle(3, low ? 0xff3b30 : 0xffb020, low ? 0.6 + 0.4 * Math.sin(t * 12) : 0.95);
+        g.beginPath();
+        g.arc(a.x, a.y, r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * frac, false);
+        g.strokePath();
       }
 
       if (a.warn) {

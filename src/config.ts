@@ -31,6 +31,21 @@ export const KINDS: Record<Kind, KindInfo> = {
 };
 
 export const FAST_MULT = 1.45;
+
+/** Money earned for handling each kind of aircraft. */
+export const FARES: Record<Kind, number> = {
+  jet: 500,
+  heavy: 900,
+  prop: 200,
+  heli: 300,
+  transit: 250,
+  depart: 400,
+};
+/** Extra pay for landing an aircraft that declared a fuel emergency. */
+export const EMERGENCY_BONUS = 1000;
+/** Seconds after handling an aircraft during which the next one extends the streak. */
+export const STREAK_WINDOW = 8;
+export const money = (n: number) => `$${Math.round(n).toLocaleString('en-US')}`;
 export const TAXI_SPEED = 20;
 /** Speed of a landing aircraft as it turns off the runway; quicker exits free the runway sooner. */
 export const EXIT_SPEED = 28;

@@ -57,10 +57,26 @@ export const sfx = {
     tone(700, 0.08, 'triangle', 0.08);
     tone(1050, 0.12, 'triangle', 0.07, 0.07);
   },
-  land: () => {
-    tone(660, 0.16, 'sine', 0.12);
-    tone(880, 0.16, 'sine', 0.1, 0.1);
-    tone(1320, 0.3, 'sine', 0.08, 0.2);
+  /** Landing chime; each step of a streak raises it by a whole tone. */
+  land: (streak = 1) => {
+    const k = Math.pow(2, (Math.min(streak - 1, 8) * 2) / 12);
+    tone(660 * k, 0.16, 'sine', 0.12);
+    tone(880 * k, 0.16, 'sine', 0.1, 0.1);
+    tone(1320 * k, 0.3, 'sine', 0.08, 0.2);
+  },
+  greased: () => {
+    tone(1568, 0.12, 'triangle', 0.06, 0.32);
+    tone(2093, 0.25, 'triangle', 0.05, 0.42);
+  },
+  radio: () => {
+    noise(0.08, 0.05);
+    tone(1250, 0.05, 'sine', 0.03, 0.08);
+  },
+  mayday: () => {
+    for (let i = 0; i < 3; i++) {
+      tone(880, 0.12, 'square', 0.04, i * 0.3);
+      tone(660, 0.12, 'square', 0.04, i * 0.3 + 0.14);
+    }
   },
   warn: () => {
     tone(980, 0.07, 'square', 0.035);

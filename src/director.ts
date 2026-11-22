@@ -22,8 +22,10 @@ export interface Entry {
 const HUD_RECTS: [number, number, number, number][] = [
   [0, 0, 190, 90],
   [420, 0, 440, 90],
-  [1110, 0, 170, 150],
+  [1110, 0, 170, 180],
   [0, 650, 680, 70],
+  // Radio log in the bottom right.
+  [960, 600, 320, 120],
 ];
 
 const SPAWN_OFFSET = 70;
